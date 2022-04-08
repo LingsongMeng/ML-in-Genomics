@@ -1,0 +1,697 @@
+---
+title: "RealDataApplicatoin"
+author: "Lingsong Meng"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+
+
+# Read Data
+
+```{r}
+# Read data
+dat.pheno <- dget("dat.pheno.Subcutaneous.Add2")
+dat.expr <- dget("dat.expr.Subcutaneous.Add2")
+
+# Gene symbol
+#if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#BiocManager::install("biomaRt")
+#BiocManager::install("EnsDb.Hsapiens.v79")
+library(biomaRt)
+library(EnsDb.Hsapiens.v79)
+Genes <- rownames(dat.expr)
+genes <- substr(Genes, 1, 15)
+G_list2 <- select(EnsDb.Hsapiens.v79, key=genes, columns="SYMBOL", keytype="GENEID" )
+Symbol <- G_list2$SYMBOL[match(genes, G_list2$GENEID)] 
+
+```
+
+
+
+
+# BMAseq Univariate Analysis
+
+```{r, eval=FALSE}
+vars <- c("BMI", "SEX", "AGE", "MHHTN", "MHT2D",
+          "MHCVD", "MHHRTATT", "MHHRTDIS", "MHPNMIAB", "MHSCHZ",
+          "MHBLDDND", "MHDPRSSN", "MHDRNKSTS", "MHASTHMA", "MHCANCERNM", "MHSZRSU")  
+
+output.uni.fdr050 <- BMAseq.uni(dat.expr.counts=dat.expr, dat.pheno=dat.pheno, var.pool=vars, cut.BF=1, cut.FDR=0.5)
+
+```
+
+
+
+
+# BMAseq Multivariate Analysis without Interaction
+
+```{r, eval=FALSE}
+var.pool <- c("BMI", "SEX", "MHHTN", "MHT2D",
+              "MHCVD", "MHHRTATT", "MHHRTDIS", "MHPNMIAB", "MHSCHZ", "AGE")   
+
+
+# Two-step way for BMAseq multivariate analysis
+
+## First step: calculate posterior model probability for each model and each gene
+output.multi1 <- BMAseq.multi.postprob(dat.expr.counts=dat.expr, dat.pheno=dat.pheno, var.pool=var.pool,
+                                       max.nvar=10, interaction=NULL, cut.BF=1)
+## For the first step, one can build model sapce and calculate posterior model probability seperately:
+MS <- Modelspace(dat.pheno=dat.pheno, var.pool=var.pool, max.nvar=10, interaction=NULL)
+output.multi1 <- BMAseq.multi.postprob.MSout(dat.expr.counts=dat.expr, dat.pheno=MS$dat.pheno.new,
+                                             model.space=MS$model.space, cut.BF=1)
+
+## Second step: identify DE genes
+output.multi2 <- BMAseq.multi.DEG(dat.pheno = output.multi1$dat.pheno.new,
+                                  model.space = output.multi1$model.space, 
+                                  post.modelprob = output.multi1$post.modelprob, 
+                                  var.pool=var.pool, interact=F, ind.incl.add=NULL, cut.FDR=0.05)
+
+```
+
+
+
+
+
+
+
+## Compare with single model approaches 
+
+```{r, eval=FALSE}
+output.multi2$summary.nDEG
+output.multi2$summary.nDEG/nrow(dat.expr)
+output.multi2$DEG.bestmodel.Main$BMI
+
+
+genes <- output.multi2$DEG.bestmodel.Main$BMI[,2]
+genes <- substr(genes, 1, 15)
+G_list2 <- select(EnsDb.Hsapiens.v79, key=genes, 
+                  columns=c("SYMBOL"), keytype="GENEID")
+symbol.DEG <- G_list2$SYMBOL[match(genes, G_list2$GENEID)]
+
+DEG.BMA.noInt <- data.frame(output.multi2$DEG.bestmodel.Main$BMI, symbol.DEG)
+#write.csv(DEG.BMA.noInt, "DEG.BMA.noInt.csv", row.names = F)
+
+
+BestModel <- output.multi2$DEG.bestmodel.Main$BMI[,3]
+BestModel.split <- strsplit(BestModel, split="+", fixed = T)
+BestModel.split <- lapply(BestModel.split, function(x) x[-1])
+var.num <- unlist(lapply(BestModel.split, function(x) length(x)))
+table(unlist(BestModel.split))
+ind <- which(var.num >= 3)
+num.SEX <- sum(unlist(lapply(BestModel.split[ind], function(x) "SEX" %in% x)))
+num.AGE <- sum(unlist(lapply(BestModel.split[ind], function(x) "MHHTN" %in% x)))
+num.MHABNWBC <- sum(unlist(lapply(BestModel.split[ind], function(x) "MHT2D" %in% x)))
+
+ind <- which(var.num == 2)
+table(unlist(BestModel.split[ind]))
+
+ind <- which(var.num == 3)
+table(unlist(BestModel.split[ind]))
+
+
+
+####################################################################################
+## BMA.noInt each variable
+post.incl.modelprob <- output.multi2$post.incl.modelprob.Main
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+
+eFDR.notOrder <- matrix(nrow=ngene, ncol=10)
+for (i in 1:10) {
+  eFDR.notOrder[,i] <- eFDR[,i][match(Genes, Genes[ind.order.gene[,i]])]
+}
+rownames(eFDR.notOrder) <- Genes
+colnames(eFDR.notOrder) <- colnames(post.incl.modelprob)
+eFDR.notOrder.Main <- data.frame(Symbol, eFDR.notOrder)
+
+
+
+
+## BMA.noInt joint 2 variables
+var.joint1 <- c("BMI","SEX")    
+# calculate posterior model inclusion probability of joint variables
+model.space.split1 <- strsplit(model.space, split = "+", fixed = T)
+ind.incl <- which(unlist(lapply(model.space.split1, function(x) 
+                  length(intersect(var.joint1, x))==length(var.joint1))) == TRUE)
+if(length(ind.incl) == 1) post.incl.prob <- post.modelprob[, ind.incl] else 
+  post.incl.prob <- apply(post.modelprob[, ind.incl], 1, sum)
+# eFDR
+cut.FDR <- 0.05
+post.incl.modelprob <- as.matrix(post.incl.prob)
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+eFDR.notOrder1 <- eFDR[match(Genes, Genes[ind.order.gene])]
+
+
+var.joint2 <- c("BMI","MHHTN")    
+# calculate posterior model inclusion probability of joint variables
+model.space.split1 <- strsplit(model.space, split = "+", fixed = T)
+ind.incl <- which(unlist(lapply(model.space.split1, function(x) 
+                  length(intersect(var.joint2, x))==length(var.joint2))) == TRUE)
+if(length(ind.incl) == 1) post.incl.prob <- post.modelprob[, ind.incl] else 
+  post.incl.prob <- apply(post.modelprob[, ind.incl], 1, sum)
+# eFDR
+cut.FDR <- 0.05
+post.incl.modelprob <- as.matrix(post.incl.prob)
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+eFDR.notOrder2 <- eFDR[match(Genes, Genes[ind.order.gene])]     
+sig2 <- which(eFDR.notOrder2 < 0.05)  ## 20 sig genes
+sig2.1 <- intersect(output.multi2$DEG.bestmodel.Main$BMI[,1], output.multi2$DEG.bestmodel.Main$MHHTN[,1]) ## 34 sig genes
+intersect(sig2, sig2.1)  ## 20 overlapped genes
+intersect(sig2, sig_gene_BMI_MHHTN)  ## 16 overlapped genes (see Dig Deeper for BMA.noInt)
+
+
+var.joint3 <- c("BMI","MHT2D")    
+# calculate posterior model inclusion probability of joint variables
+model.space.split1 <- strsplit(model.space, split = "+", fixed = T)
+ind.incl <- which(unlist(lapply(model.space.split1, function(x) 
+                  length(intersect(var.joint3, x))==length(var.joint3))) == TRUE)
+if(length(ind.incl) == 1) post.incl.prob <- post.modelprob[, ind.incl] else 
+  post.incl.prob <- apply(post.modelprob[, ind.incl], 1, sum)
+# eFDR
+cut.FDR <- 0.05
+post.incl.modelprob <- as.matrix(post.incl.prob)
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+eFDR.notOrder3 <- eFDR[match(Genes, Genes[ind.order.gene])]
+
+
+eFDR.notOrder.Joint2 <- data.frame(eFDR.notOrder1, eFDR.notOrder2, eFDR.notOrder3)
+colnames(eFDR.notOrder.Joint2) <- c("BMI.SEX", "BMI.MHHTN", "BMI.MHT2D")
+
+
+
+
+
+## BMA.noInt joint 3 variables
+var.joint1 <- c("BMI","SEX","MHHTN")    
+# calculate posterior model inclusion probability of joint variables
+model.space.split1 <- strsplit(model.space, split = "+", fixed = T)
+ind.incl <- which(unlist(lapply(model.space.split1, function(x) 
+                  length(intersect(var.joint1, x))==length(var.joint1))) == TRUE)
+if(length(ind.incl) == 1) post.incl.prob <- post.modelprob[, ind.incl] else 
+  post.incl.prob <- apply(post.modelprob[, ind.incl], 1, sum)
+# eFDR
+cut.FDR <- 0.05
+post.incl.modelprob <- as.matrix(post.incl.prob)
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+eFDR.notOrder1 <- eFDR[match(Genes, Genes[ind.order.gene])]
+sum(eFDR.notOrder1 < 0.05)
+
+
+var.joint2 <- c("BMI","SEX","MHT2D")    
+# calculate posterior model inclusion probability of joint variables
+model.space.split1 <- strsplit(model.space, split = "+", fixed = T)
+ind.incl <- which(unlist(lapply(model.space.split1, function(x) 
+                  length(intersect(var.joint2, x))==length(var.joint2))) == TRUE)
+if(length(ind.incl) == 1) post.incl.prob <- post.modelprob[, ind.incl] else 
+  post.incl.prob <- apply(post.modelprob[, ind.incl], 1, sum)
+# eFDR
+cut.FDR <- 0.05
+post.incl.modelprob <- as.matrix(post.incl.prob)
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+eFDR.notOrder2 <- eFDR[match(Genes, Genes[ind.order.gene])]
+sum(eFDR.notOrder2 < 0.05)
+
+
+var.joint3 <- c("BMI","MHHTN","MHT2D")    
+# calculate posterior model inclusion probability of joint variables
+model.space.split1 <- strsplit(model.space, split = "+", fixed = T)
+ind.incl <- which(unlist(lapply(model.space.split1, function(x) 
+                  length(intersect(var.joint3, x))==length(var.joint3))) == TRUE)
+if(length(ind.incl) == 1) post.incl.prob <- post.modelprob[, ind.incl] else 
+  post.incl.prob <- apply(post.modelprob[, ind.incl], 1, sum)
+# eFDR
+cut.FDR <- 0.05
+post.incl.modelprob <- as.matrix(post.incl.prob)
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+eFDR.notOrder3 <- eFDR[match(Genes, Genes[ind.order.gene])]
+sum(eFDR.notOrder3 < 0.05)
+
+```
+
+
+
+
+
+## Heatmap
+
+```{r, eval=FALSE}
+ind.DEG1 <- as.numeric(output.multi2$DEG.bestmodel$BMI[,1])
+ind.DEG2 <- as.numeric(output.multi2$DEG.bestmodel$SEX[,1])
+ind.DEG3 <- as.numeric(output.multi2$DEG.bestmodel$AGE[,1])
+ind.DEG4 <- as.numeric(output.multi2$DEG.bestmodel$MHHTN[,1])
+
+ind.DEG <- c(ind.DEG4[ind.dec4],ind.DEG3[ind.dec3],ind.DEG2[ind.dec2],ind.DEG1[ind.dec1])
+
+
+var1 <- "BMI"
+var2 <- "SEX"
+var3 <- "AGE"
+var4 <- "MHHTN"
+Variable <- rep(c("MHHTN","AGE","SEX","BMI"), each=20)
+Variable <- factor(Variable, levels = c("MHHTN","AGE","SEX","BMI"))
+
+id1 <- which(dat.pheno[,var1]=="low" & dat.pheno[,var2]=="female" & dat.pheno[,var3]=="young" & dat.pheno[,var4]=="no")
+id2 <- which(dat.pheno[,var1]=="low" & dat.pheno[,var2]=="female" & dat.pheno[,var3]=="young" & dat.pheno[,var4]=="yes")
+id3 <- which(dat.pheno[,var1]=="low" & dat.pheno[,var2]=="female" & dat.pheno[,var3]=="old" & dat.pheno[,var4]=="no")
+id4 <- which(dat.pheno[,var1]=="low" & dat.pheno[,var2]=="female" & dat.pheno[,var3]=="old" & dat.pheno[,var4]=="yes")
+id5 <- which(dat.pheno[,var1]=="low" & dat.pheno[,var2]=="male" & dat.pheno[,var3]=="young" & dat.pheno[,var4]=="no")
+id6 <- which(dat.pheno[,var1]=="low" & dat.pheno[,var2]=="male" & dat.pheno[,var3]=="young" & dat.pheno[,var4]=="yes")
+id7 <- which(dat.pheno[,var1]=="low" & dat.pheno[,var2]=="male" & dat.pheno[,var3]=="old" & dat.pheno[,var4]=="no")
+id8 <- which(dat.pheno[,var1]=="low" & dat.pheno[,var2]=="male" & dat.pheno[,var3]=="old" & dat.pheno[,var4]=="yes")
+id9 <- which(dat.pheno[,var1]=="high" & dat.pheno[,var2]=="female" & dat.pheno[,var3]=="young" & dat.pheno[,var4]=="no")
+id10 <- which(dat.pheno[,var1]=="high" & dat.pheno[,var2]=="female" & dat.pheno[,var3]=="young" & dat.pheno[,var4]=="yes")
+id11 <- which(dat.pheno[,var1]=="high" & dat.pheno[,var2]=="female" & dat.pheno[,var3]=="old" & dat.pheno[,var4]=="no")
+id12 <- which(dat.pheno[,var1]=="high" & dat.pheno[,var2]=="female" & dat.pheno[,var3]=="old" & dat.pheno[,var4]=="yes")
+id13 <- which(dat.pheno[,var1]=="high" & dat.pheno[,var2]=="male" & dat.pheno[,var3]=="young" & dat.pheno[,var4]=="no")
+id14 <- which(dat.pheno[,var1]=="high" & dat.pheno[,var2]=="male" & dat.pheno[,var3]=="young" & dat.pheno[,var4]=="yes")
+id15 <- which(dat.pheno[,var1]=="high" & dat.pheno[,var2]=="male" & dat.pheno[,var3]=="old" & dat.pheno[,var4]=="no")
+id16 <- which(dat.pheno[,var1]=="high" & dat.pheno[,var2]=="male" & dat.pheno[,var3]=="old" & dat.pheno[,var4]=="yes")
+
+ind.sample <- c(id1,id2,id3,id4,id5,id6,id7,id8,id9,id10,id11,id12,id13,id14,id15,id16)
+ind.sample.list <- list(id1,id2,id3,id4,id5,id6,id7,id8,id9,id10,id11,id12,id13,id14,id15,id16)
+ind.sample.len <- unlist(lapply(ind.sample.list, function(x) length(x)))
+lab=c('N \n Y \n F \n L', 'Y \n Y \n F \n L', 'N \n O \n F \n L', 'Y \n O \n F \n L',
+           'N \n Y \n M \n L', 'Y \n Y \n M \n L', 'N \n O \n M \n L', 'Y \n O \n M \n L',
+           'N \n Y \n F \n H', 'Y \n Y \n F \n H', 'N \n O \n F \n H', 'Y \n O \n F \n H',
+           'N \n Y \n M \n H', 'Y \n Y \n M \n H', 'N \n O \n M \n H', 'Y \n O \n M \n H')
+Group <- factor(c(rep(lab[1], ind.sample.len[1]), rep(lab[2], ind.sample.len[2]),
+                  rep(lab[3], ind.sample.len[3]), rep(lab[4], ind.sample.len[4]),
+                  rep(lab[5], ind.sample.len[5]), rep(lab[6], ind.sample.len[6]),
+                  rep(lab[7], ind.sample.len[7]), rep(lab[8], ind.sample.len[8]),
+                  rep(lab[9], ind.sample.len[9]), rep(lab[10], ind.sample.len[10]),
+                  rep(lab[11], ind.sample.len[11]), rep(lab[12], ind.sample.len[12]),
+                  rep(lab[13], ind.sample.len[13]), rep(lab[14], ind.sample.len[14]),
+                  rep(lab[15], ind.sample.len[15]), rep(lab[16], ind.sample.len[16])), levels=lab)
+
+E.o.old <- dat.expr.logcpm[ind.DEG, ind.sample]
+E.o <- t(apply(E.o.old, 1, function(x) rank(x)))
+rownames(E.o) <- rownames(E.o.old)
+colnames(E.o) <- colnames(E.o.old)
+
+genes <- rownames(E.o)
+genes <- substr(genes, 1, 15)
+G_list2 <- select(EnsDb.Hsapiens.v79, key=genes, columns="SYMBOL", keytype="GENEID" )
+rownames(E.o) <- G_list2$SYMBOL[match(genes, G_list2$GENEID)]
+
+genes[which(is.na(match(genes, G_list2$GENEID)==TRUE))]  # 0
+E.o.scale.t <- scale(as.matrix(t(E.o)))
+
+
+
+
+
+#library(devtools)
+#install_github("jokergoo/ComplexHeatmap")
+library(ComplexHeatmap)
+library(circlize)
+
+
+set.seed(666)
+ht <- Heatmap(t(E.o.scale.t), 
+        col=colorRamp2(c(-1.3, 0, 1.3), c("blue","white","red")), 
+        cluster_rows=F, cluster_columns=F,
+        row_split = Variable,
+        column_split = Group,
+        bottom_annotation = HeatmapAnnotation(Group=Group,
+                                              show_annotation_name=F,
+                                              show_legend=F,
+                                              border=T),
+        column_gap = unit(0, "mm"),
+        column_title_side = "bottom",
+        column_title_gp = gpar(fontsize = 8.5),
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = F)
+
+png("Heatmap.10var.noInt.Add2.png", w=5000, h=5200, res=500)
+draw(ht, show_heatmap_legend=F)
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# BMAseq Multivariate Analysis with Interaction
+
+```{r, eval=FALSE}
+var.pool <- c("BMI", "SEX", "MHHTN", "MHT2D",
+              "MHCVD", "MHHRTATT", "MHHRTDIS", "MHPNMIAB", "MHSCHZ", "AGE")   
+
+
+# Two-step way for BMAseq multivariate analysis
+
+## First step: calculate posterior model probability for each model and each gene
+output.multi1 <- BMAseq.multi.postprob(dat.expr.counts=dat.expr, dat.pheno=dat.pheno, var.pool=var.pool,
+                                       max.nvar=10, interaction="BMI&SEX", cut.BF=1)
+## For the first step, one can build model sapce and calculate posterior model probability separately:
+MS <- Modelspace(dat.pheno=dat.pheno, var.pool=var.pool, max.nvar=10, interaction="BMI&SEX")
+output.multi1 <- BMAseq.multi.postprob.MSout(dat.expr.counts=dat.expr, dat.pheno=MS$dat.pheno.new,
+                                             model.space=MS$model.space, cut.BF=1)
+
+## Second step: identify DE genes
+output.multi2 <- BMAseq.multi.DEG(dat.pheno = output.multi1$dat.pheno.new,
+                                  model.space = output.multi1$model.space, 
+                                  post.modelprob = output.multi1$post.modelprob, 
+                                  var.pool=var.pool, interact=F, ind.incl.add=NULL, cut.FDR=0.05)
+
+```
+
+
+
+
+## Compare with single model approaches 
+
+```{r, eval=FALSE}
+var.pool <- c("BMI", "SEX", "MHHTN", "MHT2D",
+              "MHCVD", "MHHRTATT", "MHHRTDIS", "MHPNMIAB", "MHSCHZ", "AGE")   
+
+
+# Voom-SM.Int (BMI+SEX+BMI:SEX)
+y0 <- voom(dat.expr, design=model.matrix(~cbind(dat.pheno$BMI,dat.pheno$SEX,dat.pheno$BMIhigh.SEXmale)))
+dat.expr.logcpm <- y0$E
+weights <- y0$weights
+fit <- my.lmFit(dat.expr.logcpm, design=model.matrix(formula("~1+BMI+SEX+BMIhigh.SEXmale"), data=dat.pheno), weights=weights, interact=F)
+loglik <- fit[[2]]$loglik
+p.val <- as.matrix(fit[[2]]$pval.BMIhigh)
+eFDR.notOrder.voom <- p.adjust(p.val, method = "BH", n = length(p.val))
+indicator.BMI.voom <- as.numeric(eFDR.notOrder.voom < 0.05)
+sum(eFDR.notOrder.voom < 0.05) # 0
+
+p.val <- as.matrix(fit[[2]]$pval.BMIhigh.SEXmale)
+eFDR.notOrder.voom <- p.adjust(p.val, method = "BH", n = length(p.val))
+indicator.BMIhigh.SEXmale.voom <- as.numeric(eFDR.notOrder.voom < 0.05)
+sum(eFDR.notOrder.voom < 0.05) # 0
+
+
+# Voom-SM.Int (Full+BMI:SEX)
+y0 <- voom(dat.expr, 
+           design=model.matrix(formula("~1+BMI+SEX+MHHTN+MHT2D+MHCVD+MHHRTATT+MHHRTDIS+MHPNMIAB+MHSCHZ+AGE+
+                                       BMIhigh.SEXmale"), data=dat.pheno))
+dat.expr.logcpm <- y0$E
+weights <- y0$weights
+fit.full <- my.lmFit(dat.expr.logcpm, 
+                     design=model.matrix(formula("~1+BMI+SEX+MHHTN+MHT2D+MHCVD+MHHRTATT+MHHRTDIS+MHPNMIAB+MHSCHZ+AGE+
+                                                 BMIhigh.SEXmale"), data=dat.pheno), weights=weights, interact=F)
+loglik.full <- fit.full[[2]]$loglik
+p.val <- as.matrix(fit.full[[2]]$pval.BMIhigh)
+eFDR.notOrder.voom <- p.adjust(p.val, method = "BH", n = length(p.val))
+indicator.BMI.voom.full <- as.numeric(eFDR.notOrder.voom < 0.05)
+sum(eFDR.notOrder.voom < 0.05) # 0
+
+p.val <- as.matrix(fit.full[[2]]$pval.BMIhigh.SEXmale)
+eFDR.notOrder.voom <- p.adjust(p.val, method = "BH", n = length(p.val))
+indicator.BMIhigh.SEXmale.voom.full <- as.numeric(eFDR.notOrder.voom < 0.05)
+sum(eFDR.notOrder.voom < 0.05) # 0
+
+
+## likelihood ratio test "fit" and "fit1" BMI main effect and interaction effect
+y1 <- voom(dat.expr, design=model.matrix(~cbind(dat.pheno$SEX)))
+dat.expr.logcpm <- y1$E
+weights <- y1$weights
+fit1 <- my.lmFit(dat.expr.logcpm, design=model.matrix(formula("~1+SEX"), data=dat.pheno), weights=weights, interact=F)
+loglik1 <- fit1[[2]]$loglik
+LR <- 2*(loglik - loglik1)
+sum(1-pchisq(LR, df=2) < 0.05) # 3509
+ind.DEG.BMI <- which(1-pchisq(LR, df=2) < 0.05)
+
+## likelihood ratio test "fit.full" and "fit2" BMI main effect and interaction effect
+y2 <- voom(dat.expr, 
+           design=model.matrix(formula("~1+SEX+MHHTN+MHT2D+MHCVD+MHHRTATT+MHHRTDIS+MHPNMIAB+MHSCHZ+AGE"),
+                               data=dat.pheno))
+dat.expr.logcpm <- y2$E
+weights <- y2$weights
+fit2 <- my.lmFit(dat.expr.logcpm,
+                 design=model.matrix(formula("~1+SEX+MHHTN+MHT2D+MHCVD+MHHRTATT+MHHRTDIS+MHPNMIAB+MHSCHZ+AGE"),
+                                     data=dat.pheno), weights=weights, interact=F)
+loglik2 <- fit2[[2]]$loglik
+LR <- 2*(loglik - loglik2)
+sum(1-pchisq(LR, df=2) < 0.05) # 1150
+ind.DEG.BMI.full <- which(1-pchisq(LR, df=2) < 0.05)
+
+# Voom-SM.Int (BMIhigh.SEXmale)
+y0 <- voom(dat.expr, design=model.matrix(~cbind(dat.pheno$BMIhigh.SEXmale)))
+dat.expr.logcpm <- y0$E
+weights <- y0$weights
+fit <- my.lmFit(dat.expr.logcpm, design=model.matrix(formula("~1+BMIhigh.SEXmale"), data=dat.pheno), weights=weights, interact=F)
+p.val <- as.matrix(fit[[2]]$pval.BMIhigh.SEXmale)
+eFDR.notOrder.voom <- p.adjust(p.val, method = "BH", n = length(p.val))
+indicator.BMIhigh.SEXmale.uni <- as.numeric(eFDR.notOrder.voom < 0.05)
+ind.DEG.BMIhigh.SEXmale.uni <- which(indicator.BMIhigh.SEXmale.uni==1)
+sum(eFDR.notOrder.voom < 0.05) # 1034
+
+# Voom-SM.Int (BMIlow.SEXmale)
+y0 <- voom(dat.expr, design=model.matrix(~cbind(dat.pheno$BMIlow.SEXmale)))
+dat.expr.logcpm <- y0$E
+weights <- y0$weights
+fit <- my.lmFit(dat.expr.logcpm, design=model.matrix(formula("~1+BMIlow.SEXmale"), data=dat.pheno), weights=weights, interact=F)
+p.val <- as.matrix(fit[[2]]$pval.BMIlow.SEXmale)
+eFDR.notOrder.voom <- p.adjust(p.val, method = "BH", n = length(p.val))
+indicator.BMIlow.SEXmale.uni <- as.numeric(eFDR.notOrder.voom < 0.05)
+ind.DEG.BMIlow.SEXmale.uni <- which(indicator.BMIlow.SEXmale.uni==1)
+sum(eFDR.notOrder.voom < 0.05) # 2602
+
+
+
+
+
+##########################################################################################################
+## BMA.Int Main Effects
+post.incl.modelprob <- output.multi2$post.incl.modelprob.Main
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+
+eFDR.notOrder <- matrix(nrow=ngene, ncol=10)
+for (i in 1:10) {
+  eFDR.notOrder[,i] <- eFDR[,i][match(Genes, Genes[ind.order.gene[,i]])]
+}
+rownames(eFDR.notOrder) <- Genes
+colnames(eFDR.notOrder) <- colnames(post.incl.modelprob)
+eFDR.notOrder1 <- data.frame(Symbol, eFDR.notOrder[,1:10])
+colnames(eFDR.notOrder1) <- c("Symbol", "BMI.Main", "SEX.Main", "MHHTN.Main", "MHT2D.Main", "MHCVD.Main", 
+                              "MHHRTATT.Main", "MHHRTDIS.Main", "MHPNMIAB.Main", "MHSCHZ.Main", "AGE.Main")
+
+
+## BMA.Int Interaction Effects
+post.incl.modelprob <- output.multi2$post.incl.modelprob.Interaction[,1:2]
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+
+eFDR.notOrder2 <- eFDR[,1][match(Genes, Genes[ind.order.gene[,1]])]
+eFDR.notOrder2 <- data.frame(eFDR.notOrder2)
+colnames(eFDR.notOrder2) <- c("BMI.Int")
+
+
+
+## BMA.Int Main or Interaction Effects
+post.incl.modelprob <- output.multi2$post.incl.modelprob.MainInteraction
+n.var <- ncol(post.incl.modelprob)
+ngene <- nrow(post.incl.modelprob)
+ntop <- c(1:ngene)
+p <- 1 - post.incl.modelprob
+eFDR <- apply(1 - p, 2, function(x) cumsum(1 - x[order(1 - x)])[ntop]/ntop)
+ind.order.gene <- apply(1 - p, 2, function(x) order(1 - x))
+
+eFDR.notOrder3 <- matrix(nrow=ngene, ncol=2)
+for (i in 1:2) {
+  eFDR.notOrder3[,i] <- eFDR[,i][match(Genes, Genes[ind.order.gene[,i]])]
+}
+colnames(eFDR.notOrder3) <- c("BMI.Main.or.Int", "SEX.Main.or.Int")
+eFDR.notOrder3 <- data.frame(eFDR.notOrder3)
+
+
+
+## index for calculating inclusive probability
+model.space.split1 <- strsplit(model.space, split = "+", fixed = T)
+ind.incl.main <- list()
+for (i in 1:n.var) {
+  ind.incl.main[[i]] <- which(unlist(lapply(model.space.split1, function(x) var.pool[i] %in% x)) == TRUE)
+}
+
+model.space.split2 <- lapply(model.space.split1, function(x) x[-c(1, which(x %in% var.pool))])
+model.space.split3 <- lapply(model.space.split2, function(x) unlist(strsplit(x, split = ".", fixed = T)))
+ind.incl.int <- list()
+for (i in 1:n.var) {
+  var.level <- paste0(var.pool[i], levels(dat.pheno[, colnames(dat.pheno) == var.pool[i]]))
+  ind.incl.int[[i]] <- which(unlist(lapply(model.space.split3, function(x) sum(var.level %in% x) > 0)) == TRUE)
+}
+
+ind.incl.mainInt <- list()
+for (i in 1:n.var) {
+ind.incl.mainInt[[i]] <- union(ind.incl.main[[i]], ind.incl.int[[i]])
+}
+
+
+ind.incl.int <- ind.incl.int[1]
+ind.incl.mainInt <- ind.incl.mainInt[1:2]
+
+```
+
+
+
+```{r, eval=FALSE}
+## Ranking plot
+
+eFDR.model.indicator.BMA.noInt <- dget("max10var.add2/eFDR.model.indicator.BMA.noInt.max10var.Add2.result")
+compare.BMAnoInt.Single <- dget("max10var.add2/compare.BMAnoInt.Single.Add2")
+
+eFDR.s.uni <- dget("max10var.add2/eFDR.indicator.single.uni.Add2.result2")
+eFDR.s.full <- dget("max10var.add2/eFDR.indicator.single.full.Add2.result2")
+eFDR.BMA.noInt <- dget("max10var.add2/eFDR.BMA.noInt.max10var.Add2.result")
+
+
+id.top700.BMA.noInt <- which(rank(eFDR.BMA.noInt$BMI) <= 700)
+id.top700.s.uni <- which(rank(eFDR.s.uni$eFDR.voom) <= 700)
+id.top700.s.full <- which(rank(eFDR.s.full$eFDR.voom) <= 700)
+ 
+id.top700 <- sort(unique(c(id.top700.BMA.noInt, id.top700.s.uni, id.top700.s.full)))
+ 
+x <- 1:length(id.top700)
+r1 <- rank(eFDR.BMA.noInt$BMI)[id.top700]
+r2 <- rank(eFDR.s.uni$eFDR.voom)[id.top700]
+r3 <- rank(eFDR.s.full$eFDR.voom)[id.top700]
+
+png("RankCompare2.Add2.png", w=3500, h=2500, res=400)
+par(mar=c(3.5,3.5,1,1))
+par(mgp=c(2.3,0.8,0))
+plot(range(x), range(c(r1,r2,r3)), type="n", xlab="index", ylab="ranks", cex=1.2, cex.axis=1.2, cex.lab=1.4)
+points(x, r1, pch=3, col="black", cex=1.2)
+points(x, r2, pch=3, col="red", cex=1.2)
+points(x, r3, pch=3, col="blue", cex=1.2)  
+text(421, 4321.5, "UGT2B4", col="red", cex=1.1)
+text(619, 4736.0, "PRKX", col="red", cex=1.1)
+text(793, 5638.0, "LINC00993", col="red", cex=1.1)
+text(849, 3903.0, "RP11-1101K5.1", col="red", cex=1.1)
+text(567, 3921.5, "MARCKSL1", col="blue", cex=1.1)
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+## Heatmap
+
+```{r, eval=FALSE}
+dat.pheno.new <- output.multi1$dat.pheno.new
+
+ind.DEG <- output.multi2$bestmodel.DEG.Interaction$BMI$`~1+BMIhigh.SEXmale`
+y0 <- voom(dat.expr, design=model.matrix(formula("~1+BMIhigh.SEXmale"), data=dat.pheno.new))
+dat.expr.logcpm <- y0$E
+weights <- y0$weights
+out <- my.lmFit(dat.expr.logcpm, design=model.matrix(formula("~1+BMIhigh.SEXmale"), data=dat.pheno.new), weights=weights)
+t <- out[[2]]$t.BMIhigh.SEXmale
+ind.dec <- order(t[as.numeric(ind.DEG[,1])], decreasing = TRUE) # 34 up-regulated  13 down-regulated
+var1 <- "SEX"
+var2 <- "BMI"
+id1 <- which(dat.pheno[,var1]=="female" & dat.pheno[,var2]=="low")
+id2 <- which(dat.pheno[,var1]=="female" & dat.pheno[,var2]=="high")
+id3 <- which(dat.pheno[,var1]=="male" & dat.pheno[,var2]=="low")
+id4 <- which(dat.pheno[,var1]=="male" & dat.pheno[,var2]=="high")
+ind.sample <- c(id1,id2,id3,id4)
+ind.sample.list <- list(id1,id2,id3,id4)
+ind.sample.len <- unlist(lapply(ind.sample.list, function(x) length(x)))
+lab=c('Female Low','Female High','Male Low','Male High')
+Group <- factor(c(rep(lab[1], ind.sample.len[1]), rep(lab[2], ind.sample.len[2]),
+                  rep(lab[3], ind.sample.len[3]), rep(lab[4], ind.sample.len[4])), levels=lab)
+
+E.o <- dat.expr.logcpm[as.numeric(ind.DEG[,1])[ind.dec], ind.sample] # try to use the ranks instead of logcpm.
+
+genes <- rownames(E.o)
+genes <- substr(genes, 1, 15)
+G_list2 <- select(EnsDb.Hsapiens.v79, key=genes, 
+                  columns=c("SYMBOL"), keytype="GENEID")
+rownames(E.o) <- G_list2$SYMBOL[match(genes, G_list2$GENEID)]
+genes[which(is.na(match(genes, G_list2$GENEID)==TRUE))]
+E.o.scale.t <- scale(as.matrix(t(E.o)))
+png("hist_SEXmale.BMIhigh.png")
+hist(E.o.scale.t)
+dev.off()
+E.o.scale.t[abs(E.o.scale.t)>3] <- 3
+
+
+set.seed(126)
+ht <- Heatmap(t(E.o.scale.t), 
+        col=colorRamp2(c(-1.3, 0, 1.3), c("blue","white","red")), 
+        cluster_rows=F, cluster_columns=F,
+        column_split = Group,
+        bottom_annotation = HeatmapAnnotation(Group=Group,
+                                              show_annotation_name=F,
+                                              show_legend=F,
+                                              border=T),
+        column_gap = unit(0, "mm"),
+        column_title_side = "bottom",
+        column_title_gp = gpar(fontsize = 12),
+        row_names_gp = gpar(fontsize = 9),
+        show_column_names = F)
+
+png("Heatmap.New10.SEXmaleBMIhigh.png", w=5000, h=2800, res=500)
+draw(ht, show_heatmap_legend=F)
+dev.off()
+
+```
+
+
+
+
