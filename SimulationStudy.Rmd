@@ -1,0 +1,605 @@
+---
+title: "Simulation Study"
+author: "Lingsong Meng"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+knitr::opts_chunk$set(warning = F)
+knitr::opts_chunk$set(message = F)
+```
+
+
+```{r}
+library(gdata)
+library(limma)
+library(edgeR)
+library(DESeq2)
+library(qvalue)
+library(BHH2)
+
+source("/Users/fred/Table/BayesResearch/Voom/Function/voom.M.R")
+source("/Users/fred/Table/BayesResearch/Voom/Function/func.lmfit3.R")
+source("/Users/fred/Table/BayesResearch/Voom/Function/func.lmfit4.R")
+source("/Users/fred/Table/BayesResearch/Voom/Function/my.lmFit.R")
+source("/Users/fred/Table/BayesResearch/Voom/Function/bayesfactor2.R")
+
+```
+
+
+
+# Simulation Function
+
+```{r}
+######################################################################
+###### RNA count data simulation
+######################################################################
+
+simRNAcount <- function(ngene = 10000, 
+                        nsub = c(5,5,5,5,5,5,5,5), 
+                        libsize = rep(11e6,40), 
+                        prop = c(0.05,0.05,0.05),
+                        d0 = 1000, s0 = 2, v0 = 2) {
+  ## nsin: number of simulation
+  ## ngene: number of genes
+  ## nsub: number of subjects per group (total 4 groups: 
+  ##       female nonsmoke, female smoke, male nonsmoke, male smoke)
+  ## libsize: size of each library
+  ## prop: proportion of genes affected by smoking(sm) and gender(g)
+  ## d0, s0, v0: tuning parameters related to gene specific variance
+
+  
+  # subject phenotype
+  sm <- c(rep(0,nsub[1]),rep(1,nsub[2]), rep(0,nsub[3]), rep(1,nsub[4]), 
+          rep(0,nsub[5]),rep(1,nsub[6]), rep(0,nsub[7]), rep(1,nsub[8]))
+  g <- c(rep(0,nsub[1]+nsub[2]), rep(1,nsub[3]+nsub[4]), 
+         rep(0,nsub[5]+nsub[6]), rep(1,nsub[7]+nsub[8]))
+  d <- c(rep(0,nsub[1]+nsub[2]+nsub[3]+nsub[4]), rep(1,nsub[5]+nsub[6]+nsub[7]+nsub[8]))
+  phenotype.design <- as.matrix(cbind(sm=sm, g=g, d=d))
+  
+  # Simulate variance for each gene
+  sigma2 <- d0*s0^2/rchisq(ngene,df=d0)
+  
+  # Simulate which genes affected by which factor
+  dif1 <- rbinom(ngene, 1, prop[1])
+  dif2 <- rbinom(ngene, 1, prop[2])
+  dif3 <- rbinom(ngene, 1, prop[3])
+    
+  # Simulate beta
+  beta1 <- rnorm(ngene, mean=0, sd=dif1*sqrt(v0*sigma2))
+  beta2 <- rnorm(ngene, mean=0, sd=dif2*sqrt(v0*sigma2))
+  beta3 <- rnorm(ngene, mean=0, sd=dif3*sqrt(v0*sigma2))
+  beta <- as.matrix(cbind(beta1=beta1, beta2=beta2, beta3=beta3))
+  
+  truth <- data.frame(beta1, beta2, beta3)
+  truth$beta1[truth$beta1 > 0] <- 1
+  truth$beta1[truth$beta1 < 0] <- -1
+  truth$beta2[truth$beta2 > 0] <- 1
+  truth$beta2[truth$beta2 < 0] <- -1
+  truth$beta3[truth$beta3 > 0] <- 1
+  truth$beta3[truth$beta3 < 0] <- -1
+  names(truth) <- c("dif1", "dif2", "dif3")
+  
+  
+  # Simulate factor
+  fc <- 1.1^(beta %*% t(phenotype.design))
+  
+  # Get distribution function of abundance proportions
+  #load("/Users/fred/Table/BayesResearch/Voom/qAbundanceDist.RData")
+  load("/ufrc/zhuo/lingsongmeng/method/Bayes/BMA/sim/qAbundanceDist.RData")
+  # Generate baseline proportions for desired number of genes
+  baselineprop <- qAbundanceDist((1:ngene)/(ngene+1))
+  baselineprop <- baselineprop/sum(baselineprop)
+    
+  # Simulate expected counts
+  mu.baseline <- matrix(baselineprop, ngene, 1) %*% matrix(libsize, 1, sum(nsub))
+  mu0 <- mu.baseline * fc
+    
+  # Biological variation
+  BCV0 <- 0.2+1/sqrt(mu0)
+  df.BCV <- 40
+  BCV <- BCV0*sqrt(df.BCV/rchisq(ngene,df=df.BCV))
+  if(NCOL(BCV)==1)  BCV <- matrix(BCV,ngene,sum(nsub))
+  shape <- 1/BCV^2
+  scale <- mu0/shape
+  mu <- matrix(rgamma(ngene*sum(nsub),shape=shape,scale=scale),ngene,sum(nsub))
+
+  # Technical variation
+  counts <- matrix(rpois(ngene*sum(nsub),lambda=mu),ngene,sum(nsub))
+  
+  list(counts, 
+       phenotype = data.frame(Smoker=sm, Gender=g, Drinkers=d), 
+       beta.sigma2 = cbind(beta1=beta1, beta2=beta2, beta3=beta3, sigma2=sigma2), 
+       factor = fc,
+       truth = truth)
+}
+
+```  
+
+
+
+
+# Analysis Function
+
+```{r}
+######################################################################
+###### RNA data analysis
+######################################################################
+
+RNAdataAnalysis <- function(counts, truth, nsub, cut.off){
+  # counts: RNA-seq counts simulation data
+  # truth: if genes truly differentially expressed or not
+  # nsub: number of subjects in each group
+  # cut.off: threshold of BF
+  
+  ngene <- n.gene <- nrow(counts)
+  
+  # Generate design matrix
+  sm <- c(rep(0,nsub[1]),rep(1,nsub[2]), rep(0,nsub[3]), rep(1,nsub[4]), 
+          rep(0,nsub[5]),rep(1,nsub[6]), rep(0,nsub[7]), rep(1,nsub[8]))
+  g <- c(rep(0,nsub[1]+nsub[2]), rep(1,nsub[3]+nsub[4]), 
+         rep(0,nsub[5]+nsub[6]), rep(1,nsub[7]+nsub[8]))
+  d <- c(rep(0,nsub[1]+nsub[2]+nsub[3]+nsub[4]), rep(1,nsub[5]+nsub[6]+nsub[7]+nsub[8]))
+  
+  design0 <- as.matrix(rep(1, sum(nsub)))
+  design1 <- model.matrix(~ sm)
+  design2 <- model.matrix(~ g)
+  design3 <- model.matrix(~ d)
+  design4 <- model.matrix(~ sm + g)
+  design5 <- model.matrix(~ sm + d)
+  design6 <- model.matrix(~ g + d)
+  design7 <- model.matrix(~ sm + g + d)
+  design8 <- "multi"
+  design <- list(design0, design1, design2, design3, design4, design5, design6, design7, design8)
+  
+  # Estimate the weight using voom with different design matrix
+  y0 <- voom.M(counts, truth, design, model=1)
+  #y1 <- voom.M(counts, truth, design, model=2)
+  #y2 <- voom.M(counts, truth, design, model=3)
+  #y3 <- voom.M(counts, truth, design, model=4)
+  #y4 <- voom.M(counts, truth, design, model=5)
+  #y5 <- voom.M(counts, truth, design, model=6)
+  #y6 <- voom.M(counts, truth, design, model=7)
+  #y7 <- voom.M(counts, truth, design, model=8)
+  #y8 <- voom.M(counts, truth, design, model=9)
+  #y <- list(y0, y1, y2, y3, y4, y5, y6, y7, y8)
+  logcpm <- y0[[1]]
+
+  #--------------------------------------------------------------------------------------------------------------
+  # Build regression models using the weight by voom with design1
+  t <- matrix(nrow=ngene, ncol=22)
+  p <- matrix(nrow=ngene, ncol=22)
+  p.adj <- matrix(nrow=ngene, ncol=22)
+  
+  fit <- lmFit(logcpm, design1, weights=y0[[2]])
+  t[,1] <- fit$coefficients[,2]/fit$stdev.unscaled[,2]/fit$sigma
+  p[,1] <- 2*pt(-abs(t[,1]),df=fit$df.residual)
+  p.adj[,1] <- qvalue(p[,1])$qvalues
+  
+  # Build regression models using the weight by voom with design4
+  fit <- lmFit(logcpm, design4, weights=y0[[2]])
+  t[,2] <- fit$coefficients[,2]/fit$stdev.unscaled[,2]/fit$sigma
+  p[,2] <- 2*pt(-abs(t[,2]),df=fit$df.residual)
+  p.adj[,2] <- qvalue(p[,2])$qvalues
+  
+  # Build regression models using the weight by voom with design5
+  fit <- lmFit(logcpm, design5, weights=y0[[2]])
+  t[,3] <- fit$coefficients[,2]/fit$stdev.unscaled[,2]/fit$sigma
+  p[,3] <- 2*pt(-abs(t[,3]),df=fit$df.residual)
+  p.adj[,3] <- qvalue(p[,3])$qvalues
+  
+  # Build regression models using the weight by voom with design7
+  fit <- lmFit(logcpm, design7, weights=y0[[2]])
+  t[,4] <- fit$coefficients[,2]/fit$stdev.unscaled[,2]/fit$sigma
+  p[,4] <- 2*pt(-abs(t[,4]),df=fit$df.residual)
+  p.adj[,4] <- qvalue(p[,4])$qvalues
+  
+  
+  # Build regression models using the weight by voom with multi-model
+  # design1
+  ind1 <- c(which(abs(truth[,1])+abs(truth[,2])+abs(truth[,3])==0), 
+            which(abs(truth[,2])+abs(truth[,3])==0 & abs(truth[,1])==1))
+  len1 <- length(ind1)
+  # design4
+  ind2 <- c(which(abs(truth[,1])+abs(truth[,3])==0 & abs(truth[,2])==1),
+            which(abs(truth[,1])+abs(truth[,2])==2 & abs(truth[,3])==0))
+  len2 <- length(c(ind1, ind2))
+  # design5
+  ind3 <- c(which(abs(truth[,1])+abs(truth[,2])==0 & abs(truth[,3])==1),
+            which(abs(truth[,1])+abs(truth[,3])==2 & abs(truth[,2])==0))
+  len3 <- length(c(ind1, ind2, ind3))
+  # design7
+  ind4 <- c(which(abs(truth[,2])+abs(truth[,3])==2 & abs(truth[,1])==0),
+            which(abs(truth[,1])+abs(truth[,2])+abs(truth[,3])==3))
+  len4 <- length(c(ind1, ind2, ind3, ind4))
+  ind <- c(ind1, ind2, ind3, ind4)
+  
+  lmfit1 <- lmFit(logcpm[ind1,], design = design1, weights = y0[[2]][ind1,])
+  lmfit2 <- lmFit(logcpm[ind2,], design = design4, weights = y0[[2]][ind2,])
+  lmfit3 <- lmFit(logcpm[ind3,], design = design5, weights = y0[[2]][ind3,])
+  lmfit4 <- lmFit(logcpm[ind4,], design = design7, weights = y0[[2]][ind4,])
+  t[,5] <- c(lmfit1$coefficients[,2]/lmfit1$stdev.unscaled[,2]/lmfit1$sigma,
+             lmfit2$coefficients[,2]/lmfit2$stdev.unscaled[,2]/lmfit2$sigma,
+             lmfit3$coefficients[,2]/lmfit3$stdev.unscaled[,2]/lmfit3$sigma,
+             lmfit4$coefficients[,2]/lmfit4$stdev.unscaled[,2]/lmfit4$sigma)
+  p[,5] <- c(2*pt(-abs(t[1:len1,5]),df=lmfit1$df.residual), 
+             2*pt(-abs(t[(len1+1):len2,5]),df=lmfit2$df.residual),
+             2*pt(-abs(t[(len2+1):len3,5]),df=lmfit3$df.residual),
+             2*pt(-abs(t[(len3+1):len4,5]),df=lmfit4$df.residual))[order(ind)]
+  p.adj[,5] <- qvalue(p[,5])$qvalues
+  
+  #------------------------------------------------------------------------------------------------------------
+  # Build regression models using the limma with design1
+  y.l <- cpm(counts, log = T, prior.count = 1)
+  
+  fit.l1 <- lmFit(y.l, design1, weights=NULL)
+  t[,6] <- fit.l1$coefficients[,2]/fit.l1$stdev.unscaled[,2]/fit.l1$sigma
+  p[,6] <- 2*pt(-abs(t[,6]),df=fit.l1$df.residual)
+  p.adj[,6] <- qvalue(p[,6])$qvalues
+  
+  # Build regression models using the limma with design4
+  fit.l4 <- lmFit(y.l, design4, weights=NULL)
+  t[,7] <- fit.l4$coefficients[,2]/fit.l4$stdev.unscaled[,2]/fit.l4$sigma
+  p[,7] <- 2*pt(-abs(t[,7]),df=fit.l4$df.residual)
+  p.adj[,7] <- qvalue(p[,7])$qvalues
+  
+  # Build regression models using the limma with design5
+  fit.l5 <- lmFit(y.l, design5, weights=NULL)
+  t[,8] <- fit.l5$coefficients[,2]/fit.l5$stdev.unscaled[,2]/fit.l5$sigma
+  p[,8] <- 2*pt(-abs(t[,8]),df=fit.l5$df.residual)
+  p.adj[,8] <- qvalue(p[,8])$qvalues
+  
+  # Build regression models using the limma with design7
+  fit.l7 <- lmFit(y.l, design7, weights=NULL)
+  t[,9] <- fit.l7$coefficients[,2]/fit.l7$stdev.unscaled[,2]/fit.l7$sigma
+  p[,9] <- 2*pt(-abs(t[,9]),df=fit.l7$df.residual)
+  p.adj[,9] <- qvalue(p[,9])$qvalues
+  
+  # Build regression models using the limma with multi-model
+  lmFit1 <- lmFit(y.l[ind1,], design1, weights=NULL)
+  lmFit2 <- lmFit(y.l[ind2,], design4, weights=NULL)
+  lmFit3 <- lmFit(y.l[ind3,], design5, weights=NULL)
+  lmFit4 <- lmFit(y.l[ind4,], design7, weights=NULL)
+  t[,10] <- c(lmFit1$coefficients[,2]/lmFit1$stdev.unscaled[,2]/lmFit1$sigma,
+              lmFit2$coefficients[,2]/lmFit2$stdev.unscaled[,2]/lmFit2$sigma,
+              lmFit3$coefficients[,2]/lmFit3$stdev.unscaled[,2]/lmFit3$sigma,
+              lmFit4$coefficients[,2]/lmFit4$stdev.unscaled[,2]/lmFit4$sigma)
+  p[,10] <- c(2*pt(-abs(t[1:len1,10]),df=lmFit1$df.residual), 
+              2*pt(-abs(t[(len1+1):len2,10]),df=lmFit2$df.residual),
+              2*pt(-abs(t[(len2+1):len3,10]),df=lmFit3$df.residual),
+              2*pt(-abs(t[(len3+1):len4,10]),df=lmFit4$df.residual))[order(ind)]
+  p.adj[,10] <- qvalue(p[,10])$qvalues
+  
+  #------------------------------------------------------------------------------------------------------------
+  # Build regression models using EdgeR with design1
+  groupSm <- factor(sm)
+  groupSmG <- factor(c(rep(0,nsub[1]), rep(1,nsub[2]), rep(2,nsub[3]), rep(3,nsub[4]), 
+                       rep(0,nsub[5]), rep(1,nsub[6]), rep(2,nsub[7]), rep(3,nsub[8])))
+  groupSmD <- factor(c(rep(0,nsub[1]), rep(1,nsub[2]), rep(0,nsub[3]), rep(1,nsub[4]), 
+                        rep(2,nsub[5]), rep(3,nsub[6]), rep(2,nsub[7]), rep(3,nsub[8])))
+  groupSmGD <- factor(c(rep(0,nsub[1]), rep(1,nsub[2]), rep(2,nsub[3]), rep(3,nsub[4]), 
+                        rep(4,nsub[5]), rep(5,nsub[6]), rep(6,nsub[7]), rep(7,nsub[8])))
+  
+  zSm <- DGEList(counts=counts, lib.size=colSums(counts), group=groupSm, genes=truth$dif1)
+  designSm <- model.matrix(~0+group, data=zSm$samples)
+  zSm <- estimateGLMTrendedDisp(zSm, designSm)
+  zSm <- estimateGLMTagwiseDisp(zSm, designSm)
+  fitSm <- glmQLFit(zSm, designSm)
+  qlfSm <- glmQLFTest(fitSm, contrast=c(-1,1))
+  p[,11] <- qlfSm$table$PValue
+  p.adj[,11] <- qvalue(p[,11])$qvalues
+  
+  # Build regression models using EdgeR with design4
+  zSmG <- DGEList(counts=counts, lib.size=colSums(counts), group=groupSmG, genes=truth$dif1)
+  designSmG <- model.matrix(~0+group, data=zSmG$samples)
+  zSmG <- estimateGLMTrendedDisp(zSmG, designSmG)
+  zSmG <- estimateGLMTagwiseDisp(zSmG, designSmG)
+  fitSmG <- glmQLFit(zSmG, designSmG)
+  qlfSmG <- glmQLFTest(fitSmG, contrast=c(-1,1,-1,1))
+  p[,12] <- qlfSmG$table$PValue
+  p.adj[,12] <- qvalue(p[,12])$qvalues
+  
+  # Build regression models using EdgeR with design5
+  zSmD <- DGEList(counts=counts, lib.size=colSums(counts), group=groupSmD, genes=truth$dif1)
+  designSmD <- model.matrix(~0+group, data=zSmD$samples)
+  zSmD <- estimateGLMTrendedDisp(zSmD, designSmD)
+  zSmD <- estimateGLMTagwiseDisp(zSmD, designSmD)
+  fitSmD <- glmQLFit(zSmD, designSmD)
+  qlfSmD <- glmQLFTest(fitSmD, contrast=c(-1,1,-1,1))
+  p[,13] <- qlfSmD$table$PValue
+  p.adj[,13] <- qvalue(p[,13])$qvalues
+  
+  # Build regression models using EdgeR with design7
+  zSmGD <- DGEList(counts=counts, lib.size=colSums(counts), group=groupSmGD, genes=truth$dif1)
+  designSmGD <- model.matrix(~0+group, data=zSmGD$samples)
+  zSmGD <- estimateGLMTrendedDisp(zSmGD, designSmGD)
+  zSmGD <- estimateGLMTagwiseDisp(zSmGD, designSmGD)
+  fitSmGD <- glmQLFit(zSmGD, designSmGD)
+  qlfSmGD <- glmQLFTest(fitSmGD, contrast=c(-1,1,-1,1,-1,1,-1,1))
+  p[,14] <- qlfSmGD$table$PValue
+  p.adj[,14] <- qvalue(p[,14])$qvalues
+  
+  # Build regression models using EdgeR with multi-model
+  z.1 <- DGEList(counts=counts[ind1,], lib.size=colSums(counts[ind1,]), group=groupSm, genes=truth$dif1[ind1])
+  z.1 <- estimateGLMTrendedDisp(z.1, designSm)
+  z.1 <- estimateGLMTagwiseDisp(z.1, designSm)
+  fit.1 <- glmQLFit(z.1, designSm)
+  qlf.1 <- glmQLFTest(fit.1, contrast=c(-1,1))
+  
+  z.2 <- DGEList(counts=counts[ind2,], lib.size=colSums(counts[ind2,]), group=groupSmG, genes=truth$dif1[ind2])
+  z.2 <- estimateGLMTrendedDisp(z.2, designSmG)
+  z.2 <- estimateGLMTagwiseDisp(z.2, designSmG)
+  fit.2 <- glmQLFit(z.2, designSmG)
+  qlf.2 <- glmQLFTest(fit.2, contrast=c(-1,1,-1,1))
+  
+  z.3 <- DGEList(counts=counts[ind3,], lib.size=colSums(counts[ind3,]), group=groupSmD, genes=truth$dif1[ind3])
+  z.3 <- estimateGLMTrendedDisp(z.3, designSmD)
+  z.3 <- estimateGLMTagwiseDisp(z.3, designSmD)
+  fit.3 <- glmQLFit(z.3, designSmD)
+  qlf.3 <- glmQLFTest(fit.3, contrast=c(-1,1,-1,1))
+  
+  z.4 <- DGEList(counts=counts[ind4,], lib.size=colSums(counts[ind4,]), group=groupSmGD, genes=truth$dif1[ind4])
+  z.4 <- estimateGLMTrendedDisp(z.4, designSmGD)
+  z.4 <- estimateGLMTagwiseDisp(z.4, designSmGD)
+  fit.4 <- glmQLFit(z.4, designSmGD)
+  qlf.4 <- glmQLFTest(fit.4, contrast=c(-1,1,-1,1,-1,1,-1,1))
+  
+  p.m <- c(qlf.1$table$PValue, qlf.2$table$PValue, qlf.3$table$PValue, qlf.4$table$PValue)
+  p[,15] <- p.m[order(ind)]
+  p.adj[,15] <- qvalue(p[,15])$qvalues
+  
+  #------------------------------------------------------------------------------------------------------------
+  # Build regression models using DEseq with design1
+  colData <- DataFrame(sm=factor(sm))
+  dds <- DESeqDataSetFromMatrix(counts, colData, formula(~ sm))
+  dds <- DESeq(dds)
+  res <- results(dds, name="sm_1_vs_0")
+  p[,16] <- res$pvalue
+  p.adj[,16] <- qvalue(p[,16])$qvalues
+  # Build regression models using the DEseq with design4
+  colData <- DataFrame(sm=factor(sm), g=factor(g))
+  dds <- DESeqDataSetFromMatrix(counts, colData, formula(~ sm + g))
+  dds <- DESeq(dds)
+  res <- results(dds, name="sm_1_vs_0")
+  p[,17] <- res$pvalue
+  p.adj[,17] <- qvalue(p[,17])$qvalues
+  # Build regression models using the DEseq with design5
+  colData <- DataFrame(sm=factor(sm), d=factor(d))
+  dds <- DESeqDataSetFromMatrix(counts, colData, formula(~ sm + d))
+  dds <- DESeq(dds)
+  res <- results(dds, name="sm_1_vs_0")
+  p[,18] <- res$pvalue
+  p.adj[,18] <- qvalue(p[,18])$qvalues
+  # Build regression models using the DEseq with design7
+  colData <- DataFrame(sm=factor(sm), g=factor(g), d=factor(d))
+  dds <- DESeqDataSetFromMatrix(counts, colData, formula(~ sm + g + d))
+  dds <- DESeq(dds)
+  res <- results(dds, name="sm_1_vs_0")
+  p[,19] <- res$pvalue
+  p.adj[,19] <- qvalue(p[,19])$qvalues
+  
+  # Build regression models using DEseq with multi-model
+  colData.1 <- DataFrame(sm=factor(sm))
+  dds.1 <- DESeqDataSetFromMatrix(counts[ind1,], colData.1, formula(~ sm))
+  dds.1 <- DESeq(dds.1)
+  res.1 <- results(dds.1, name="sm_1_vs_0")
+  
+  colData.2 <- DataFrame(sm=factor(sm), g=factor(g))
+  dds.2 <- DESeqDataSetFromMatrix(counts[ind2,], colData.2, formula(~ sm + g))
+  dds.2 <- DESeq(dds.2)
+  res.2 <- results(dds.2, name="sm_1_vs_0")
+  
+  colData.3 <- DataFrame(sm=factor(sm), d=factor(d))
+  dds.3 <- DESeqDataSetFromMatrix(counts[ind3,], colData.3, formula(~ sm + d))
+  dds.3 <- DESeq(dds.3)
+  res.3 <- results(dds.3, name="sm_1_vs_0")
+  
+  colData.4 <- DataFrame(sm=factor(sm), g=factor(g), d=factor(d))
+  dds.4 <- DESeqDataSetFromMatrix(counts[ind4,], colData.4, formula(~ sm + g + d))
+  dds.4 <- DESeq(dds.4)
+  res.4 <- results(dds.4, name="sm_1_vs_0")
+  
+  p.m <- c(res.1$pvalue, res.2$pvalue, res.3$pvalue, res.4$pvalue)
+  p[,20] <- p.m[order(ind)]
+  p.adj[,20] <- qvalue(p[,20])$qvalues
+  
+  #------------------------------------------------------------------------------------------------------------
+  # BMA Approach based on voom weight 1 c=1
+  out.fit <- func.lmfit4(dat.expr=logcpm, dat.subj=data.frame(Smokers=ifelse(sm==1,"Sm","NonSm"),
+                                                              Gender=ifelse(g==1,"M","F"), 
+                                                              Drinkers=ifelse(d==1,"Dr","NonDr")), 
+                         weights=y0[[2]], vars=c("Smokers","Gender","Drinkers"), max.vars=3, interact=F)
+  
+  bf.max <- t(apply(out.fit$out.bf,1, function(x) ifelse(x==max(x)&x>cut.off-1,1,0)))
+  prior.model <- apply(bf.max,2, sum)/n.gene
+  pm.est <- prior.model
+  n.model <- length(prior.model)
+  pm.prior0 <- pm.prior1 <- rep(0.5/(n.model-1), n.model-1)
+  alpha <- 0.2
+  for (j in 1:30){
+    pm.prior1 <- pm.est[-1]/apply(t(apply(out.fit$out.bf[,-1], 1, function(x) 
+                                                                 x/(1-sum(pm.prior0)+sum(x*pm.prior0)))),2,mean)
+    pm.prior0 <- pm.prior0+(pm.prior1-pm.prior0)*alpha
+  }
+  prior.model <- c(1-sum(pm.prior0),pm.prior0)
+  bmodelprob <- t(apply(out.fit$out.bf,1, function(x) x*prior.model/sum(x*prior.model)))
+  post.model <- apply(bmodelprob,2, function(x) sum(x)/length(x))
+  p[,21] <- 1 - apply(bmodelprob[,c(2,5,6,8)],1,sum)
+  
+  #------------------------------------------------------------------------------------------------------------
+  # BMA Approach based on voom weight 1 c=2
+  out.fit <- func.lmfit4(dat.expr=logcpm, dat.subj=data.frame(Smokers=ifelse(sm==1,"Sm","NonSm"),
+                                                              Gender=ifelse(g==1,"M","F"), 
+                                                              Drinkers=ifelse(d==1,"Dr","NonDr")), 
+                         weights=y0[[2]], vars=c("Smokers","Gender","Drinkers"), max.vars=3, interact=F)
+  
+  bf.max <- t(apply(out.fit$out.bf,1, function(x) ifelse(x==max(x)&x>cut.off,1,0)))
+  prior.model <- apply(bf.max,2, sum)/n.gene
+  pm.est <- prior.model
+  n.model <- length(prior.model)
+  pm.prior0 <- pm.prior1 <- rep(0.5/(n.model-1), n.model-1)
+  alpha <- 0.2
+  for (j in 1:30){
+    pm.prior1 <- pm.est[-1]/apply(t(apply(out.fit$out.bf[,-1], 1, function(x) 
+                                                                 x/(1-sum(pm.prior0)+sum(x*pm.prior0)))),2,mean)
+    pm.prior0 <- pm.prior0+(pm.prior1-pm.prior0)*alpha
+  }
+  prior.model <- c(1-sum(pm.prior0),pm.prior0)
+  bmodelprob <- t(apply(out.fit$out.bf,1, function(x) x*prior.model/sum(x*prior.model)))
+  post.model <- apply(bmodelprob,2, function(x) sum(x)/length(x))
+  p[,22] <- 1 - apply(bmodelprob[,c(2,5,6,8)],1,sum)
+  
+  ntop <- seq(1, ngene, by=1)
+  fdr.est <- apply(1-p[,c(21,22)], 2, function(x) cumsum(1-x[order(1-x)])[ntop]/ntop)
+  
+  #---------------------------------------------------------------------------------------------------------------
+  # Calculate the power and False Discovery Rate
+  matrix <- matrix(nrow=ngene, ncol=4)
+  power.fdr <- list()
+  id.o <- c(1:ngene)
+  for(i in 1:22){
+    o <- order(p[,i])
+    truth.o <- abs(truth$dif1[o])
+    matrix[,1] <- p[,i][o]
+    matrix[,2] <- cumsum(truth.o)/sum(truth.o)
+    matrix[,3] <- 1 - cumsum(truth.o)/id.o
+    matrix[,4] <- p.adj[,i][o]
+    colnames(matrix) <- c("p","sensitivity","fdr","efdr")
+    power.fdr[[i]] <- matrix
+  }
+  power.fdr[[21]][,4] <- fdr.est[,1] 
+  power.fdr[[22]][,4] <- fdr.est[,2]
+  
+  # Output 
+  power.fdr
+}
+
+```
+
+
+
+
+# Some Parameters
+
+```{r}
+nsim <- 50
+prop <- c(0.2, 0.2, 0.2)
+
+xlim <- c(0, 0.5)
+ylim <- c(0, 0.6)
+xlim1 <- c(0, 1)
+ylim1 <- c(0, 1)
+
+main <- main1 <- " "
+
+position <- "bottomright"
+position1 <- "topleft"
+
+```
+
+
+# Run Simulation
+
+## Unequal library size, Unequal Subject Number, Unbalanced Group, n=40
+
+```{r, eval=FALSE}
+set.seed(200)
+power.fdr <- list()
+for(i in 1:22){
+  power.fdr[[i]] <- matrix(0, nrow=10000, ncol=4)
+}
+
+for(i in 1:nsim){
+  print(i)
+  sim<- simRNAcount(ngene = 10000, nsub = c(13,2,3,2,2,3,2,13), libsize = rep(c(20e6,2e6),20), 
+                    prop = prop, d0 = 1000, s0 = 2, v0 = 2)
+  output <- RNAdataAnalysis(counts=sim[[1]], truth=sim[[5]], nsub = c(13,2,3,2,2,3,2,13), cut.off=2)
+  for(j in 1:22){
+    power.fdr[[j]] <- power.fdr[[j]] + output[[j]]
+  }
+}
+
+for(i in 1:22){
+  power.fdr[[i]] <- power.fdr[[i]]/nsim
+}
+power.fdr5 <- power.fdr
+
+```
+
+
+## Unequal library size, Unequal Subject Number, Unbalanced Group, n=80
+
+```{r}
+t <- Sys.time()
+
+set.seed(200)
+power.fdr <- list()
+for(i in 1:22){
+  power.fdr[[i]] <- matrix(0, nrow=10000, ncol=4)
+}
+
+for(i in 1:nsim){
+  print(i)
+  sim<- simRNAcount(ngene = 10000, nsub = 2*c(13,2,3,2,2,3,2,13), libsize = rep(c(20e6,2e6),40), 
+                    prop = prop, d0 = 1000, s0 = 2, v0 = 2)
+  output <- RNAdataAnalysis(counts=sim[[1]], truth=sim[[5]], nsub = 2*c(13,2,3,2,2,3,2,13), cut.off=2)
+  for(j in 1:22){
+    power.fdr[[j]] <- power.fdr[[j]] + output[[j]]
+  }
+}
+
+for(i in 1:22){
+  power.fdr[[i]] <- power.fdr[[i]]/nsim
+}
+power.fdr5.1 <- power.fdr
+
+```
+
+
+
+
+
+
+
+
+# Plot
+
+## Small Piece Compare model Sensitivity vs FDR
+
+```{r, fig.height=6, fig.width=6}
+png('figure1a.png', width=1500, height=1500, res=300)
+par(mar=c(4.0,4.0,0.5,0.5))
+par(mgp=c(2.5,1,0))
+plot(0,0,xlim = xlim,ylim = ylim,type = "n",xlab="FDR",ylab="Sensitivity",main=main,cex.axis=1,cex.lab=1)
+lines(power.fdr5[[1]][,3], power.fdr5[[1]][,2], col="black") #voom.w0.S
+lines(power.fdr5[[2]][,3], power.fdr5[[2]][,2], col="blue") #voom.w0.S+G
+lines(power.fdr5[[3]][,3], power.fdr5[[3]][,2], col="purple") #voom.w0.S+D
+lines(power.fdr5[[4]][,3], power.fdr5[[4]][,2], col="yellow") #voom.w0.S+G+D
+lines(power.fdr5[[5]][,3], power.fdr5[[5]][,2], col="green") #voom.w0.Multi
+lines(power.fdr5[[21]][,3], power.fdr5[[21]][,2], col="orange") #BMAseq, c=1
+lines(power.fdr5[[22]][,3], power.fdr5[[22]][,2], col="red") #BMAseq, c=2
+#legend(position,legend=c("voom.w0.S","voom.w0.S+G","voom.w0.S+D","voom.w0.S+G+D",
+#                         "voom.w0.Multi","BMAseq.c=1","BMAseq.c=2"),
+#                 col=c("black","blue","purple","yellow","green","orange","red"), lty=1, cex=0.9)
+dev.off()
+
+png('figure1b.png', width=1500, height=1500, res=300)
+par(mar=c(4.0,4.0,0.5,0.5))
+par(mgp=c(2.5,1,0))
+plot(0,0,xlim = xlim,ylim = ylim,type = "n",xlab="FDR",ylab="Sensitivity",main=main,cex.axis=1,cex.lab=1)
+lines(power.fdr5.1[[1]][,3], power.fdr5.1[[1]][,2], col="black") #voom.w0.S
+lines(power.fdr5.1[[2]][,3], power.fdr5.1[[2]][,2], col="blue") #voom.w0.S+G
+lines(power.fdr5.1[[3]][,3], power.fdr5.1[[3]][,2], col="purple") #voom.w0.S+D
+lines(power.fdr5.1[[4]][,3], power.fdr5.1[[4]][,2], col="yellow") #voom.w0.S+G+D
+lines(power.fdr5.1[[5]][,3], power.fdr5.1[[5]][,2], col="green") #voom.w0.Multi
+lines(power.fdr5.1[[21]][,3], power.fdr5.1[[21]][,2], col="orange") #BMAseq, c=1
+lines(power.fdr5.1[[22]][,3], power.fdr5.1[[22]][,2], col="red") #BMAseq, c=2
+legend(position,legend=c("voom.w0.S","voom.w0.S+G","voom.w0.S+D","voom.w0.S+G+D",
+                         "voom.w0.Multi","BMAseq.c=1","BMAseq.c=2"),
+                 col=c("black","blue","purple","yellow","green","orange","red"), lty=1, cex=0.9)
+dev.off()
+
+```
+
+
